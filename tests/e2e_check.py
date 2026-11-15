@@ -82,4 +82,68 @@ runs = call("GET", f"{API}/runs")[1]
 statuses = {r["status"] for r in runs}
 check("运行历史含 published 与 failed", {"published", "failed"} <= statuses, str(statuses))
 
+# 9. 数仓单消费者同步：按发布顺序交付、未确认重拉同一张、确认推进游标
+start_state = call("GET", f"{API}/sync/state")[1]
+start_acked = start_state["last_acked_snapshot_id"]
+if start_state["delivered_snapshot_id"] is not None:
+    # 上次跑批中断在已交付未确认：重拉必须是同一张，先消费掉它
+    st, resumed = call("POST", f"{API}/sync/pull")
+    check("重启后重拉未确认快照", resumed["redelivery"] is True
+          and resumed["snapshot"]["snapshot_id"] == start_state["delivered_snapshot_id"])
+    call("POST", f"{API}/sync/ack",
+         {"snapshot_id": start_state["delivered_snapshot_id"]})
+
+delivered_ids = []
+while True:
+    st, body = call("POST", f"{API}/sync/pull")
+    check("拉取返回 200", st == 200)
+    if body["status"] == "empty":
+        break
+    sid = body["snapshot"]["snapshot_id"]
+    check("快照含通报/来源/批号/边",
+          "notices" in body["snapshot"] and "edges" in body["snapshot"])
+
+    st, again = call("POST", f"{API}/sync/pull")
+    check("未确认重拉仍为同一张",
+          again["status"] == "delivered"
+          and again["snapshot"]["snapshot_id"] == sid and again["redelivery"])
+
+    st, ack = call("POST", f"{API}/sync/ack", {"snapshot_id": sid})
+    check("确认当前已交付快照成功", st == 200 and ack["status"] == "acked")
+    st, dup = call("POST", f"{API}/sync/ack", {"snapshot_id": sid})
+    check("重复确认无害", st == 200 and dup["status"] == "already_acked")
+    delivered_ids.append(sid)
+
+expected_ids = sorted(s["id"] for s in call("GET", f"{API}/snapshots")[1]
+                      if s["status"] == "published"
+                      and (start_acked is None or s["id"] > start_acked))
+check("交付按发布顺序且不跳号", delivered_ids == expected_ids,
+      f"delivered={delivered_ids} expected={expected_ids}")
+
+# 10. 新发布成为下一张；noop 不产生新交付；越序确认被拒
+call("POST", f"{SITE}/admin/reload")  # 仅递增版号，内容不变
+st, body = call("POST", f"{API}/collect", {"notice_number": "2024-004"})
+check("reload 后新采集发布成功", st == 200 and body["status"] == "published")
+st, pulled = call("POST", f"{API}/sync/pull")
+check("新快照按序交付", pulled["snapshot"]["snapshot_id"] == body["snapshot_id"])
+
+st, noop = call("POST", f"{API}/collect", {"notice_number": "2024-004"})
+check("同版同内容 noop", noop["status"] == "noop")
+st, repull = call("POST", f"{API}/sync/pull")
+check("noop 不产生新交付", repull["snapshot"]["snapshot_id"] == body["snapshot_id"])
+
+st, bad = call("POST", f"{API}/sync/ack", {"snapshot_id": body["snapshot_id"] + 999})
+check("越序确认返回 409", st == 409, f"http={st} {bad}")
+
+st, ack = call("POST", f"{API}/sync/ack", {"snapshot_id": body["snapshot_id"]})
+check("确认最新快照", st == 200 and ack["last_acked_snapshot_id"] == body["snapshot_id"])
+st, empty = call("POST", f"{API}/sync/pull")
+check("确认后无可交付快照", empty["status"] == "empty")
+state = call("GET", f"{API}/sync/state")[1]
+check("同步游标与状态一致",
+      state["delivered_snapshot_id"] is None and state["pending_count"] == 0, str(state))
+
+check("同步游标与状态一致",
+      state["delivered_snapshot_id"] is None and state["pending_count"] == 0, str(state))
+
 print("\n全部 E2E 场景通过。")

@@ -113,3 +113,82 @@ def test_openapi_contains_examples_and_tags(client):
     assert "2024-003" in str(schema)
     declared_tags = {t["name"] for t in spec["tags"]}
     assert {"采集", "查询", "审计", "运维"} <= declared_tags
+
+
+# ---- 数仓同步 API ---------------------------------------------------
+
+def test_sync_pull_ack_over_http(client):
+    c, _, _ = client
+    assert c.post("/sync/pull").json()["status"] == "empty"
+
+    collected = c.post("/collect", json={"notice_number": "N2"}).json()
+    sid = collected["snapshot_id"]
+
+    pull = c.post("/sync/pull")
+    assert pull.status_code == 200
+    body = pull.json()
+    assert body["status"] == "delivered"
+    assert body["snapshot"]["snapshot_id"] == sid
+    assert {n["notice_number"] for n in body["snapshot"]["notices"]} == {"N1", "N2"}
+
+    # 未确认重拉同一张
+    again = c.post("/sync/pull").json()
+    assert again["redelivery"] is True
+    assert again["snapshot"]["snapshot_id"] == sid
+
+    ack = c.post("/sync/ack", json={"snapshot_id": sid})
+    assert ack.status_code == 200
+    assert ack.json()["status"] == "acked"
+    # 重复确认无害
+    repeat = c.post("/sync/ack", json={"snapshot_id": sid})
+    assert repeat.status_code == 200
+    assert repeat.json()["status"] == "already_acked"
+    # 下次拉取为空
+    assert c.post("/sync/pull").json()["status"] == "empty"
+
+    state = c.get("/sync/state").json()
+    assert state["last_acked_snapshot_id"] == sid
+    assert state["delivered_snapshot_id"] is None
+    assert state["pending_count"] == 0
+
+
+def test_sync_ack_out_of_order_over_http(client):
+    c, _, _ = client
+    # 尚未交付任何快照
+    resp = c.post("/sync/ack", json={"snapshot_id": 1})
+    assert resp.status_code == 409
+    assert "尚未交付" in resp.json()["detail"]
+
+    collected = c.post("/collect", json={"notice_number": "N2"}).json()
+    sid = collected["snapshot_id"]
+    c.post("/sync/pull")
+    resp = c.post("/sync/ack", json={"snapshot_id": sid + 999})
+    assert resp.status_code == 409
+    assert "越序确认" in resp.json()["detail"]
+
+
+def test_sync_ignores_failed_collect_and_reuses_snapshot(client):
+    c, fetcher, _ = client
+    first = c.post("/collect", json={"notice_number": "N2"}).json()
+    pulled = c.post("/sync/pull").json()
+    assert pulled["snapshot"]["snapshot_id"] == first["snapshot_id"]
+    c.post("/sync/ack", json={"snapshot_id": first["snapshot_id"]})
+
+    # 失败采集：无新交付
+    fetcher.pages = {1: {p: FakePage(h, 1) for p, h in BROKEN.items()}}
+    assert c.post("/collect", json={"notice_number": "N2"}).status_code == 409
+    assert c.post("/sync/pull").json()["status"] == "empty"
+
+    # 同版同内容 noop：无新交付
+    fetcher.pages = {1: {p: FakePage(h, 1) for p, h in GOOD.items()}}
+    noop = c.post("/collect", json={"notice_number": "N2"}).json()
+    assert noop["status"] == "noop"
+    assert c.post("/sync/pull").json()["status"] == "empty"
+
+
+def test_sync_openapi_route_documented(client):
+    c, _, _ = client
+    spec = c.get("/openapi.json").json()
+    assert {"/sync/pull", "/sync/ack", "/sync/state"} <= set(spec["paths"])
+    declared_tags = {t["name"] for t in spec["tags"]}
+    assert "数仓同步" in declared_tags

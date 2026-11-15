@@ -10,9 +10,18 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
-from .db import Database
+from .db import AckOutOfOrderError, Database
 from .fetcher import HttpFetcher
-from .models import AncestorView, CollectRequest, CollectResponse, NoticeView
+from .models import (
+    AncestorView,
+    CollectRequest,
+    CollectResponse,
+    NoticeView,
+    SyncAckRequest,
+    SyncAckResponse,
+    SyncPullResponse,
+    SyncStateView,
+)
 from .service import CollectorService
 
 DB_PATH = os.environ.get("COLLECTOR_DB", "/data/collector/collector.db")
@@ -44,12 +53,16 @@ app = FastAPI(
         "- 并发采集时晚完成的旧版发布被 CAS 拒绝，不能覆盖新版；\n"
         "- 整张子图单事务原子写入，重启不会读到半张图。\n\n"
         "内置样例：2024-003（更正链 003→002→001）、2024-001（同号镜像合并）、"
-        "CYCLE-A/CYCLE-B（循环引用）；站点 v2 制造同号异文冲突，v3 制造链接失效。"
+        "CYCLE-A/CYCLE-B（循环引用）；站点 v2 制造同号异文冲突，v3 制造链接失效。\n\n"
+        "数仓同步（单消费者）：POST /sync/pull 按发布顺序交付一张完整快照；"
+        "未确认时重拉返回同一张；POST /sync/ack 只接受已交付的当前快照，"
+        "重复确认幂等，越序确认 409。游标持久化，重启后可续传。"
     ),
     lifespan=lifespan,
     openapi_tags=[
         {"name": "采集", "description": "发起整次采集，失败一律不发布"},
         {"name": "查询", "description": "读取最新已发布图中的通报、批号与引用关系"},
+        {"name": "数仓同步", "description": "单消费者的快照拉取与确认（至多一次未确认交付）"},
         {"name": "审计", "description": "运行历史与快照版本历史"},
         {"name": "运维", "description": "健康检查"},
     ],
@@ -105,6 +118,42 @@ async def list_runs(limit: int = 50) -> list[dict]:
 @app.get("/snapshots", tags=["审计"], summary="快照版本历史（已发布快照不可变；staging 残留会在启动时清理）")
 async def list_snapshots() -> list[dict]:
     return app.state.db.list_snapshots()
+
+
+# ---- 数仓消费者同步 -------------------------------------------------
+
+@app.post("/sync/pull", response_model=SyncPullResponse, tags=["数仓同步"],
+          summary="拉取下一张完整快照（未确认时重拉返回同一张）",
+          description=(
+              "按发布顺序（snapshot id 升序）交付一张完整快照，包含通报、来源 URL、"
+              "批号与引用边。\n\n"
+              "- 存在未确认的已交付快照时，原样重发同一张（`redelivery=true`），"
+              "不会跳过它去交付更新的快照；\n"
+              "- 采集失败、同版复用（noop）不产生新快照，因此不会产生新交付；\n"
+              "- 接入前已发布的快照同样会被交付；游标持久化，服务重启后继续。\n"
+              "- 没有可交付快照时返回 `status=empty`。"))
+async def sync_pull() -> dict:
+    return app.state.db.pull_snapshot()
+
+
+@app.post("/sync/ack", response_model=SyncAckResponse, tags=["数仓同步"],
+          summary="确认已交付的当前快照",
+          description=(
+              "只接受当前已交付的那一张快照，确认后游标推进并可拉取下一张。\n\n"
+              "- 重复确认任何已确认过的快照返回 `already_acked`（无害，便于 ack 响应丢失后重试）；\n"
+              "- 确认未交付的、或尚未推进到的更晚快照返回 409（越序确认）。"),
+          responses={409: {"description": "越序确认：快照未交付、已过期或超出当前游标"}})
+async def sync_ack(req: SyncAckRequest) -> dict:
+    try:
+        return app.state.db.ack_snapshot(req.snapshot_id)
+    except AckOutOfOrderError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/sync/state", response_model=SyncStateView, tags=["数仓同步"],
+         summary="查看单消费者同步游标与待交付数量")
+async def sync_state() -> dict:
+    return app.state.db.sync_state()
 
 
 @app.get("/healthz", tags=["运维"], summary="健康检查")

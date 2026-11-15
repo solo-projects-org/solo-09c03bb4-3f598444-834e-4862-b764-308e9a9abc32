@@ -9,16 +9,25 @@
 """
 from __future__ import annotations
 
-import os
+import json
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+# 单个数仓消费者：所有拉取/确认请求共享同一条游标。
+# 若未来接入多个消费者，可把该常量扩展为请求参数并复用同一套表。
+CONSUMER_ID = "warehouse"
+
 
 class StaleRevisionError(Exception):
     """CAS 失败：试图用较旧或同版异文的图覆盖最新图。"""
+
+
+class AckOutOfOrderError(Exception):
+    """越序确认：试图确认尚未交付的快照。"""
 
 
 class Database:
@@ -28,6 +37,9 @@ class Database:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
+        # 单连接跨线程共享：所有事务与读取都经同一把 RLock 串行化，
+        # 避免并发请求在同一连接上嵌套 BEGIN。
+        self._lock = threading.RLock()
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA synchronous=FULL")
@@ -37,14 +49,15 @@ class Database:
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
-        conn = self._conn
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield conn
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        with self._lock:
+            conn = self._conn
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def _init_schema(self) -> None:
         # executescript 会自行提交，不能包在手动事务里
@@ -118,8 +131,26 @@ class Database:
                     ON notices(snapshot_id, notice_number);
                 CREATE INDEX IF NOT EXISTS idx_edges_from ON notice_edges(snapshot_id, from_notice);
                 CREATE INDEX IF NOT EXISTS idx_edges_to ON notice_edges(snapshot_id, to_notice);
+                -- 单个数仓消费者的同步游标：同一时刻最多租借一张已发布快照，
+                -- 确认后才推进 last_acked 并释放租借。状态与业务数据同库持久化。
+                CREATE TABLE IF NOT EXISTS sync_consumers (
+                    consumer_id TEXT PRIMARY KEY,
+                    delivered_snapshot_id INTEGER REFERENCES snapshots(id),
+                    last_acked_snapshot_id INTEGER,
+                    delivered_at TEXT,
+                    acked_at TEXT,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_snapshots_stream
+                    ON snapshots(status, id);
                 """
             )
+        # 消费者游标惰性创建也行，但显式建行便于 GET /sync/state 直接读取。
+        # last_acked 为空表示尚未确认任何快照，接入前已发布的快照也会从头交付。
+        self._conn.execute(
+            "INSERT OR IGNORE INTO sync_consumers(consumer_id) VALUES (?)",
+            (CONSUMER_ID,),
+        )
 
     def cleanup_staging(self) -> int:
         """删除未提交事务遗留的 staging 图（崩溃恢复）。"""
@@ -160,8 +191,6 @@ class Database:
     # ---- 原子发布 + CAS ------------------------------------------
     def publish_snapshot(self, crawl_result, root_notice_number: str) -> dict[str, Any]:
         """在单事务内写整张子图并做 CAS 检查。返回 {snapshot_id, outcome}。"""
-        import json
-
         notices = crawl_result.notices
         edges = crawl_result.edges
         revision = crawl_result.site_revision
@@ -254,19 +283,24 @@ class Database:
 
     # ---- 查询 -----------------------------------------------------
     def latest_published_snapshot(self, notice_number: str | None = None) -> sqlite3.Row | None:
-        if notice_number is None:
+        with self._lock:
+            if notice_number is None:
+                return self._conn.execute(
+                    "SELECT * FROM snapshots WHERE status='published' "
+                    "ORDER BY site_revision DESC, id DESC LIMIT 1"
+                ).fetchone()
             return self._conn.execute(
-                "SELECT * FROM snapshots WHERE status='published' "
-                "ORDER BY site_revision DESC, id DESC LIMIT 1"
+                """SELECT s.* FROM snapshots s
+                   JOIN notice_latest nl ON nl.snapshot_id=s.id
+                   WHERE nl.notice_number=?""",
+                (notice_number,),
             ).fetchone()
-        return self._conn.execute(
-            """SELECT s.* FROM snapshots s
-               JOIN notice_latest nl ON nl.snapshot_id=s.id
-               WHERE nl.notice_number=?""",
-            (notice_number,),
-        ).fetchone()
 
     def get_notice(self, notice_number: str) -> dict | None:
+        with self._lock:
+            return self._get_notice_locked(notice_number)
+
+    def _get_notice_locked(self, notice_number: str) -> dict | None:
         snap = self.latest_published_snapshot(notice_number)
         if snap is None:
             return None
@@ -303,6 +337,10 @@ class Database:
         }
 
     def get_ancestors(self, notice_number: str) -> list[dict] | None:
+        with self._lock:
+            return self._get_ancestors_locked(notice_number)
+
+    def _get_ancestors_locked(self, notice_number: str) -> list[dict] | None:
         snap = self.latest_published_snapshot(notice_number)
         if snap is None:
             return None
@@ -330,40 +368,252 @@ class Database:
         return result
 
     def get_graph(self) -> dict | None:
-        snap = self.latest_published_snapshot()
-        if snap is None:
-            return None
-        sid = snap["id"]
-        notices = [dict(r) for r in self._conn.execute(
-            "SELECT notice_number, content_hash, site_revision FROM notices "
-            "WHERE snapshot_id=? ORDER BY notice_number", (sid,)).fetchall()]
-        edges = [dict(r) for r in self._conn.execute(
-            "SELECT from_notice, to_notice, source_url, target_url FROM notice_edges "
-            "WHERE snapshot_id=? ORDER BY id", (sid,)).fetchall()]
-        return {"snapshot_id": sid, "site_revision": snap["site_revision"],
-                "root_notice_number": snap["root_notice_number"],
-                "notices": notices, "edges": edges}
+        with self._lock:
+            snap = self.latest_published_snapshot()
+            if snap is None:
+                return None
+            sid = snap["id"]
+            notices = [dict(r) for r in self._conn.execute(
+                "SELECT notice_number, content_hash, site_revision FROM notices "
+                "WHERE snapshot_id=? ORDER BY notice_number", (sid,)).fetchall()]
+            edges = [dict(r) for r in self._conn.execute(
+                "SELECT from_notice, to_notice, source_url, target_url FROM notice_edges "
+                "WHERE snapshot_id=? ORDER BY id", (sid,)).fetchall()]
+            return {"snapshot_id": sid, "site_revision": snap["site_revision"],
+                    "root_notice_number": snap["root_notice_number"],
+                    "notices": notices, "edges": edges}
 
     def list_runs(self, limit: int = 50) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            if d.get("conflict_detail"):
-                try:
-                    import json
-                    d["conflict_detail"] = json.loads(d["conflict_detail"])
-                except (ValueError, TypeError):
-                    pass
-            out.append(d)
-        return out
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            out = []
+            for r in rows:
+                d = dict(r)
+                if d.get("conflict_detail"):
+                    try:
+                        d["conflict_detail"] = json.loads(d["conflict_detail"])
+                    except (ValueError, TypeError):
+                        pass
+                out.append(d)
+            return out
 
     def list_snapshots(self) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT id, site_revision, root_notice_number, content_hash, status, created_at "
-            "FROM snapshots ORDER BY id DESC").fetchall()
-        return [dict(r) for r in rows]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, site_revision, root_notice_number, content_hash, status, created_at "
+                "FROM snapshots ORDER BY id DESC").fetchall()
+            return [dict(r) for r in rows]
+
+    # ---- 数仓消费者同步：拉取 / 确认 ------------------------------
+    #
+    # 交付顺序 = snapshots.id 升序。SQLite 写事务由 BEGIN IMMEDIATE 串行化，
+    # 快照在发布事务内分配 AUTOINCREMENT id，因此 id 顺序就是提交（发布）顺序。
+    # 只有 status='published' 的快照可被交付；失败采集与同版 noop 都不新增
+    # snapshots 行，天然不会产生新交付。
+    #
+    # 游标持久化在 sync_consumers 表（与业务数据同库同事务）：
+    # - last_acked_snapshot_id：已确认到的最后一张快照，NULL 表示尚未确认过；
+    # - delivered_snapshot_id：当前已交付但未确认的租借快照，NULL 表示无租借。
+    # 服务重启后两列仍在，因此重拉仍返回同一张，确认后继续向后推进。
+
+    def _consumer_row(self, c: sqlite3.Connection) -> sqlite3.Row:
+        row = c.execute(
+            "SELECT * FROM sync_consumers WHERE consumer_id=?", (CONSUMER_ID,)
+        ).fetchone()
+        if row is None:  # 惰性兜底（表初始化时已插入）
+            c.execute("INSERT INTO sync_consumers(consumer_id) VALUES (?)", (CONSUMER_ID,))
+            row = c.execute(
+                "SELECT * FROM sync_consumers WHERE consumer_id=?", (CONSUMER_ID,)
+            ).fetchone()
+        return row
+
+    @staticmethod
+    def _pending_count(c: sqlite3.Connection, after_id: int | None) -> int:
+        return int(c.execute(
+            "SELECT COUNT(*) FROM snapshots WHERE status='published' AND id > ?",
+            (after_id or 0,)).fetchone()[0])
+
+    def _delivery_payload(self, c: sqlite3.Connection, snap: sqlite3.Row) -> dict:
+        """读取一张已发布快照的完整内容（通报、来源、批号、引用边）。"""
+        sid = snap["id"]
+        notice_rows = c.execute(
+            "SELECT id, notice_number, content_hash, site_revision FROM notices "
+            "WHERE snapshot_id=? ORDER BY notice_number", (sid,)).fetchall()
+        source_rows = c.execute(
+            "SELECT notice_id, url, title, fetched_at, content_hash FROM notice_sources "
+            "WHERE snapshot_id=? ORDER BY url", (sid,)).fetchall()
+        batch_rows = c.execute(
+            "SELECT notice_id, batch_number, source_url FROM notice_batches "
+            "WHERE snapshot_id=? ORDER BY batch_number, source_url", (sid,)).fetchall()
+        edge_rows = c.execute(
+            "SELECT from_notice, to_notice, source_url, target_url FROM notice_edges "
+            "WHERE snapshot_id=? ORDER BY id", (sid,)).fetchall()
+
+        sources: dict[int, list[dict]] = {}
+        for r in source_rows:
+            sources.setdefault(r["notice_id"], []).append({
+                "url": r["url"], "title": r["title"],
+                "fetched_at": r["fetched_at"], "content_hash": r["content_hash"],
+            })
+        batches: dict[int, list[dict]] = {}
+        for r in batch_rows:
+            batches.setdefault(r["notice_id"], []).append({
+                "batch_number": r["batch_number"], "source_url": r["source_url"],
+            })
+        corrects: dict[str, set[str]] = {}
+        corrected_by: dict[str, set[str]] = {}
+        edges: list[dict] = []
+        for r in edge_rows:
+            edges.append({"from_notice": r["from_notice"],
+                          "to_notice": r["to_notice"],
+                          "source_url": r["source_url"],
+                          "target_url": r["target_url"]})
+            corrects.setdefault(r["from_notice"], set()).add(r["to_notice"])
+            corrected_by.setdefault(r["to_notice"], set()).add(r["from_notice"])
+
+        notices = [{
+            "notice_number": r["notice_number"],
+            "content_hash": r["content_hash"],
+            "site_revision": r["site_revision"],
+            "sources": sources.get(r["id"], []),
+            "batches": batches.get(r["id"], []),
+            "corrects": sorted(corrects.get(r["notice_number"], set())),
+            "corrected_by": sorted(corrected_by.get(r["notice_number"], set())),
+        } for r in notice_rows]
+
+        return {
+            "snapshot_id": sid,
+            "site_revision": snap["site_revision"],
+            "root_notice_number": snap["root_notice_number"],
+            "content_hash": snap["content_hash"],
+            "created_at": snap["created_at"],
+            "notices": notices,
+            "edges": edges,
+        }
+
+    def pull_snapshot(self) -> dict:
+        """按发布顺序交付一张完整快照。
+
+        已有未确认租借时原样重发同一张；否则取 id 大于 last_acked 的最小
+        已发布快照并登记租借。没有可交付快照时返回 status='empty'。
+        """
+        with self._tx() as c:
+            row = self._consumer_row(c)
+            delivered = row["delivered_snapshot_id"]
+            last_acked = row["last_acked_snapshot_id"]
+
+            if delivered is not None:
+                snap = c.execute(
+                    "SELECT * FROM snapshots WHERE id=? AND status='published'",
+                    (delivered,)).fetchone()
+                if snap is not None:
+                    return {
+                        "consumer_id": CONSUMER_ID,
+                        "status": "delivered",
+                        "redelivery": True,
+                        "snapshot": self._delivery_payload(c, snap),
+                        "last_acked_snapshot_id": last_acked,
+                        "delivered_snapshot_id": snap["id"],
+                        "pending_count": self._pending_count(c, last_acked),
+                    }
+                # 正常流程不会发生（published 快照永不再改状态）；防御性释放租借
+                c.execute(
+                    "UPDATE sync_consumers SET delivered_snapshot_id=NULL, "
+                    "delivered_at=NULL, updated_at=datetime('now') WHERE consumer_id=?",
+                    (CONSUMER_ID,))
+
+            snap = c.execute(
+                "SELECT * FROM snapshots WHERE status='published' AND id > ? "
+                "ORDER BY id LIMIT 1", (last_acked or 0,)).fetchone()
+            if snap is None:
+                return {
+                    "consumer_id": CONSUMER_ID,
+                    "status": "empty",
+                    "redelivery": False,
+                    "snapshot": None,
+                    "last_acked_snapshot_id": last_acked,
+                    "delivered_snapshot_id": None,
+                    "pending_count": 0,
+                }
+
+            c.execute(
+                "UPDATE sync_consumers SET delivered_snapshot_id=?, "
+                "delivered_at=datetime('now'), updated_at=datetime('now') "
+                "WHERE consumer_id=?", (snap["id"], CONSUMER_ID))
+            return {
+                "consumer_id": CONSUMER_ID,
+                "status": "delivered",
+                "redelivery": False,
+                "snapshot": self._delivery_payload(c, snap),
+                "last_acked_snapshot_id": last_acked,
+                "delivered_snapshot_id": snap["id"],
+                "pending_count": self._pending_count(c, last_acked),
+            }
+
+    def ack_snapshot(self, snapshot_id: int) -> dict:
+        """确认当前已交付的快照。
+
+        - 只接受已交付的当前快照；
+        - 重复确认任何已确认过的快照都是无害的（ack 响应丢失后重试常见）；
+        - 确认未交付、尚未推进到的更晚快照一律拒绝（越序）。
+        """
+        with self._tx() as c:
+            row = self._consumer_row(c)
+            delivered = row["delivered_snapshot_id"]
+            last_acked = row["last_acked_snapshot_id"]
+
+            if delivered is not None and delivered == snapshot_id:
+                outcome = "acked"
+                c.execute(
+                    "UPDATE sync_consumers SET last_acked_snapshot_id=?, "
+                    "delivered_snapshot_id=NULL, delivered_at=NULL, "
+                    "acked_at=datetime('now'), updated_at=datetime('now') "
+                    "WHERE consumer_id=?", (snapshot_id, CONSUMER_ID))
+                last_acked = snapshot_id
+                delivered = None
+            elif (last_acked is not None and snapshot_id <= last_acked
+                  and c.execute(
+                      "SELECT 1 FROM snapshots WHERE id=? AND status='published'",
+                      (snapshot_id,)).fetchone() is not None):
+                # 已确认过的快照再次确认（含乱序到达的重复 ack）：无害
+                outcome = "already_acked"
+            elif delivered is not None:
+                raise AckOutOfOrderError(
+                    f"越序确认：当前已交付快照为 {delivered}，不能确认 {snapshot_id}")
+            elif last_acked is not None and snapshot_id < last_acked:
+                raise AckOutOfOrderError(
+                    f"越序确认：快照 {snapshot_id} 早于已确认游标 {last_acked}")
+            else:
+                raise AckOutOfOrderError(
+                    f"越序确认：快照 {snapshot_id} 尚未交付，请先调用 /sync/pull")
+
+            return {
+                "consumer_id": CONSUMER_ID,
+                "status": outcome,
+                "acked_snapshot_id": snapshot_id,
+                "last_acked_snapshot_id": last_acked,
+                "delivered_snapshot_id": delivered,
+                "pending_count": self._pending_count(c, last_acked),
+            }
+
+    def sync_state(self) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM sync_consumers WHERE consumer_id=?", (CONSUMER_ID,)
+            ).fetchone()
+            last_acked = row["last_acked_snapshot_id"] if row else None
+            total = int(self._conn.execute(
+                "SELECT COUNT(*) FROM snapshots WHERE status='published'").fetchone()[0])
+            return {
+                "consumer_id": CONSUMER_ID,
+                "last_acked_snapshot_id": last_acked,
+                "delivered_snapshot_id": row["delivered_snapshot_id"] if row else None,
+                "delivered_at": row["delivered_at"] if row else None,
+                "acked_at": row["acked_at"] if row else None,
+                "pending_count": self._pending_count(self._conn, last_acked),
+                "published_snapshots": total,
+            }
 
     def close(self) -> None:
         self._conn.close()
@@ -371,7 +621,6 @@ class Database:
 
 def _graph_hash(notices, edges) -> str:
     import hashlib
-    import json
     payload = json.dumps(
         {"notices": {n: r.content_hash for n, r in sorted(notices.items())},
          "edges": sorted((e["from_notice"], e["to_notice"], e["target_url"])

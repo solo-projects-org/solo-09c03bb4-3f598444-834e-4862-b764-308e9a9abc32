@@ -5,7 +5,9 @@
 
 - 一个可切换版本、每次改动递增全站版号的**本地 HTML 公告站**；
 - 一个基于 **FastAPI + SQLite** 的采集 API，提交通报号后沿“更正自”链接递归抓取，
-  按通报号合并不同 URL，保存来源、批号与引用边。
+  按通报号合并不同 URL，保存来源、批号与引用边；
+- 一个供**数仓单消费者**使用的快照拉取/确认 API：按发布顺序交付完整快照，
+  未确认时重拉仍给同一张，确认后推进游标；服务重启、断线、采集与拉取交错都不漏图。
 
 ## 一、目录结构
 
@@ -17,14 +19,14 @@
 │   ├── parser.py          # 标准库 html.parser 页面解析
 │   ├── fetcher.py         # httpx 抓取，强制校验 X-Site-Revision
 │   ├── service.py         # 采集编排，失败不发布
-│   ├── db.py              # SQLite 持久层：单事务原子发布、CAS、崩溃恢复
+│   ├── db.py              # SQLite 持久层：单事务原子发布、CAS、崩溃恢复、数仓同步游标
 │   └── models.py          # Pydantic 模型
 ├── site/                  # 本地公告站（仅标准库）
 │   ├── server.py          # 版号管理、版本切换管理 API、静态服务
 │   ├── v1/                # 基线版本：更正链、同号镜像、循环引用样例
 │   ├── v2/                # 同号异文冲突样例（镜像正文被改写）
 │   └── v3/                # 链接失效样例（2024-001.html 被删除）
-├── tests/                 # 20 个单元/API/并发测试 + E2E 脚本
+├── tests/                 # 33 个单元/API/并发/同步测试 + E2E 脚本
 ├── Dockerfile / site/Dockerfile
 └── docker-compose.yml
 ```
@@ -69,6 +71,23 @@ curl localhost:8000/runs
 curl localhost:8000/snapshots
 ```
 
+### 数仓消费者同步（Swagger「数仓同步」分组）
+
+```bash
+# 按发布顺序领取一张完整快照（snapshot 内含 notices/sources/batches/edges）
+curl -X POST localhost:8000/sync/pull
+# 未确认前再次拉取：redelivery=true，snapshot_id 不变，不会跳号
+curl -X POST localhost:8000/sync/pull
+# 确认当前已交付的那一张；重复确认幂等，越序/未交付确认返回 409
+curl -X POST localhost:8000/sync/ack -H 'Content-Type: application/json' \
+  -d '{"snapshot_id":1}'
+# 查看游标与待交付数量
+curl localhost:8000/sync/state
+```
+
+`/sync/pull` 返回 `status=delivered|empty`、`snapshot`、`last_acked_snapshot_id`、
+`delivered_snapshot_id`、`pending_count`；`/sync/ack` 返回 `acked` 或 `already_acked`。
+
 ## 四、关键正确性语义
 
 | 需求 | 实现方式 |
@@ -84,6 +103,12 @@ curl localhost:8000/snapshots
 | 晚完成的旧版不能覆盖新版 | 发布事务内 CAS：同种子 revision 更小则 `StaleRevisionError` 拒绝 |
 | 重启读不到半张图 | 整张子图在单个 `BEGIN IMMEDIATE` 事务写入；启动清理 staging 残留；WAL |
 | 并发安全 | SQLite 单库 + IMMEDIATE 事务串行化发布；同版同内容幂等 noop |
+| 数仓按序交付一张完整快照 | `/sync/pull` 以 `snapshots.id` 升序交付（id 在发布事务内分配，即发布顺序），一次返回通报、来源、批号与引用边 |
+| 未确认重拉给同一张 | 游标表 `sync_consumers.delivered_snapshot_id` 记录租借；未确认时始终重发它，不越过交付更新的快照 |
+| 确认语义 | `/sync/ack` 只接受当前已交付快照；重复确认任何已确认快照返回 `already_acked`（无害）；未交付/越序确认 409 |
+| 失败或同版复用不产生新交付 | 失败与 noop 都不新增 `snapshots` 行，拉取只读 `status='published'`，因此天然无新交付 |
+| 断线与重启续传 | 游标与业务数据同库同事务持久化；重启后重拉仍未确认的那张，确认后继续向后 |
+| 接入前已发布快照可领 | `last_acked` 初始为 NULL，交付从 `id > 0` 的最小已发布快照开始 |
 
 ## 五、内置样例
 
@@ -107,7 +132,7 @@ SITE_CONTENT_ROOT=./site SITE_STATE_DIR=./data/site SITE_PORT=8080 python site/s
 COLLECTOR_DB=./data/collector.db SITE_BASE_URL=http://127.0.0.1:8080 \
   uvicorn collector.main:app --reload --port 8000
 
-# 单元/API/并发测试（20 个，无需外部服务）
+# 单元/API/并发/同步测试（33 个，无需外部服务）
 python -m pytest
 
 # 端到端矩阵（需先按上启动两个服务，默认地址 127.0.0.1:18080 / 18000）
@@ -132,3 +157,9 @@ python tests/e2e_check.py
 ```
 
 并发下旧版被拒绝时 `status` 为 `rejected_stale`，HTTP 409，已发布新版保持不变。
+
+越序确认示例（`POST /sync/ack`，HTTP 409）：
+
+```json
+{"detail": "越序确认：当前已交付快照为 4，不能确认 1003"}
+```
